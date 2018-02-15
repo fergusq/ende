@@ -1,0 +1,346 @@
+#!/usr/bin/env röda
+
+/** Main program **/
+
+main args... {
+	code := ""
+	args | for arg do
+		if [ arg =~ "-h|-help|--help" ] do
+			print "usage: ende { -e <code> | <file> }"
+			continue
+		done
+		if [ arg = "-e" ] do
+			code .= pull() .. "\n"
+		else
+			readLines(arg) | code .= _ .. "\n"
+		done
+	done
+	env := OBJ
+	if [ #code > 0 ] do
+		parse code | _.evaluate env
+	else
+		while true do
+			push ">> "
+			parse(pull()) | _.evaluate env
+		done
+	done
+}
+
+/** Interpreter **/
+
+{
+	STACK := []
+}
+
+printStack {
+	STACK | enum | for elem, i do
+		errprint `$i: $elem`.."\n"
+	done
+}
+
+record Value {
+	dict : map = {
+		dict := new map
+		dict["__proto__"] = OBJ
+		return dict
+	}()
+	
+	rec : boolean = FALSE
+	
+	function has key {
+		return FALSE if [ self.rec ]
+		self.rec = TRUE
+		push self.dict[key]? or (self.dict["__proto__"]? and self.dict["__proto__"].has(key))
+		self.rec = FALSE
+	}
+	
+	function get key {
+		return NIL if [ self.rec ]
+		return self.dict[key] if [ self.dict[key]? ]
+		self.rec = TRUE
+		self.dict["__proto__"].get key if [ self.dict["__proto__"]? ] else
+		{ printStack(); error "Key not found: "..key.."\n"; push NIL }
+		self.rec = FALSE
+	}
+	
+	queue : Queue = new Queue
+	
+	function subenv parent, &vars... {
+		if [ #vars = 0 ] do
+			subenv := new Value
+			subenv.dict["__proto__"] = self
+			subenv.dict["__parent__"] = self
+			return subenv
+		else
+			vars | _ := self.subenv(parent)
+		done
+	}
+	
+	function end {
+		self.queue.pullAll | (self.parent()).queue.push
+	}
+	
+	function pulln n {
+		while [ n > 0 ] do
+			n --
+			self.queue.pull
+		done
+	}
+	
+	function push vals... {
+		self.queue.push *vals
+	}
+	
+	function parPulln n {
+		if self.hasParent do
+			(self.parent()).pulln n
+		else
+			printStack()
+			error "attempted to access the parent of the top object"
+		done
+	}
+	
+	function parPush vals... {
+		if self.hasParent do
+			(self.parent()).push *vals
+		else
+			printStack()
+			error "attempted to access the parent of the top object"
+		done
+	}
+	
+	function hasParent {
+		return self.dict["__parent__"]?
+	}
+	
+	function parent {
+		return self.dict["__parent__"]
+	}
+	
+	function toString {
+		self.toRepr
+	}
+	
+	function toRepr {
+		return "[object "..self.dict["__name__"].toString().."]" if [ self.dict["__name__"]? ]
+		return "..." if [ self.rec ]
+		self.rec = TRUE
+		val := [keys(self.dict) | push `$key: ${self.dict[key].toRepr()}` for key]&", "
+		push "{"..val.."; "..self.queueToString().."}"
+		self.rec = FALSE
+	}
+	
+	function queueToString {
+		if self.hasParent do
+			return self.parent().queueToString() .. " / " .. self.queue.toString()
+		else
+			return self.queue.toString()
+		done
+	}
+	
+	function toInteger {
+		return 0
+	}
+}
+
+record CmdValue(body) : Value {
+	function eval cenv {
+		cenv.subenv cenv, env2
+		body env2 | env2.push
+		env2.end
+	}
+	
+	function toString {
+		return "<command "..body..">"
+	}
+}
+
+record StrValue(str) : Value {
+	dict : map = {
+		dict := new map
+		dict["__proto__"] = STR_PROTO
+		return dict
+	}()
+	
+	function eval cenv {
+		cenv.subenv cenv, env2
+		parse(str) | _.evaluate env2
+		env2.end
+	}
+	
+	function toString {
+		return str
+	}
+	
+	function toRepr {
+		return `"$str"`
+	}
+	
+	function toInteger {
+		parseInteger str if [ str =~ "-?[0-9]+" ] else return 0
+	}
+}
+
+record IntValue(int) : Value {
+	dict : map = {
+		dict := new map
+		dict["__proto__"] = INT_PROTO
+		return dict
+	}()
+	
+	function toInteger {
+		return int
+	}
+	
+	function toString {
+		return `$int`
+	}
+}
+
+/** Builtins **/
+
+post_load: {
+	OBJ := 0
+	OBJ := new Value
+	del OBJ.dict["__proto__"]
+
+	NIL := new Value
+	OBJ := new Value
+	
+	STR_PROTO := new Value
+	INT_PROTO := new Value
+	
+	OBJ.dict["__name__"] = new StrValue("Object")
+	keys BUILTINS | OBJ.dict[_1] = new CmdValue(BUILTINS[_1])
+	OBJ.dict["__proto__"] = NIL
+	
+	NIL.dict["__name__"] = new StrValue("Nil")
+	
+	STR_PROTO.dict["__name__"] = new StrValue("String")
+	STR_PROTO.dict["."] = new CmdValue({ |env|; push new StrValue(env.parent().toString()..env.parPulln(1).toString()) })
+	
+	INT_PROTO.dict["__name__"] = new StrValue("Integer")
+	INT_PROTO.dict["+"] = new CmdValue({ |env|; push new IntValue(env.parent().toInteger()+env.parPulln(1).toInteger()) })
+	INT_PROTO.dict["-"] = new CmdValue({ |env|; push new IntValue(env.parent().toInteger()-env.parPulln(1).toInteger()) })
+	INT_PROTO.dict["*"] = new CmdValue({ |env|; push new IntValue(env.parent().toInteger()*env.parPulln(1).toInteger()) })
+	INT_PROTO.dict["/"] = new CmdValue({ |env|; push new IntValue(env.parent().toInteger()/env.parPulln(1).toInteger()) })
+}
+
+{
+	BUILTINS := new map
+	
+	/* queue */
+	BUILTINS["<"] = { |env|; (env.parent()).queue.peek }
+	BUILTINS[","] = { |env|; env.parPulln 1 | {} }
+	BUILTINS["%"] = { |env|; (env.parent()).parPulln 1 }
+	BUILTINS["@"] = { |env|; (env.parent()).parPush env.parent().parPulln(1) }
+	
+	/* numbers */
+	BUILTINS["#"] = { |env|; push new IntValue(0) }
+	seq 0, 9 | for i do
+		BUILTINS[`$i`] = { |env|; push env.parPulln()*10+i}
+	done
+
+	/* eval */
+	BUILTINS["^"] = { |env|; env.subenv env, env2; env.parPulln 1 | parse(_.toString()) | _.evaluate env2; env2.end }
+	/*BUILTINS["^"] = { |env|; obj := env.parPulln(1); obj.subenv env.parent(), env2; env.parPulln 1 | parse(_.toString()) | _.evaluate env2; env2.end }*/
+	BUILTINS[":"] = { |env|; obj := env.parPulln(1); env.parPulln 1 | parse(_.toString()) | _.evaluate obj }
+	
+	/* objs */
+	BUILTINS["$"] = { |env|; push env }
+	BUILTINS[">"] = { |env|; env.parPulln 2 | obj.push val for obj, val }
+	BUILTINS["&"] = { |env|; env.parPulln 1 | _.pulln(1) }
+	BUILTINS["?"] = { |env|; env.parPulln 1 | (env.parent()).get(key.toString()) for key }
+	BUILTINS["="] = { |env|; env.parPulln 2 | (env.parent()).dict[key.toString()] = val for key, val }
+
+	/* i/o */
+	BUILTINS["d"] = { |env|; env.parPulln 1 | STDOUT.push _.toString() }
+	BUILTINS["r"] = { |env|; env.parPulln 1 | STDOUT.push _.toRepr() }
+	BUILTINS["q"] = { |env|; env.parPulln 1 | STDOUT.push _.queue.toString() }
+}
+
+/** Parser **/
+
+parse code {
+	chars code | for char do
+		push(new BlockCommand(parseBlock("{", "}"))) if [ char = "{" ] else
+		push(new StringCommand(parseBlock("[", "]"))) if [ char = "[" ] else
+		push(new CallCommand(parseBlock("(", ")"))) if [ char = "(" ] else
+		push(new CallCommand(char)) if [ char =~ `\S` ]
+	done
+}
+
+parseBlock start, end {
+	block := ""
+	i := 1
+	while [ i > 0 ] do
+		pull char
+		i ++ if [ char = start ]
+		i -- if [ char = end ]
+		block .= char if [ i > 0 ]
+	done
+	return block
+}
+
+/** Commands **/
+
+record BlockCommand(code) {
+	function evaluate env {
+		STACK += env.toRepr()
+		env.subenv env, env2
+		parse code | _.evaluate env2
+		env.push env2
+		del STACK[-1]
+	}
+}
+
+record StringCommand(str) {
+	function evaluate env {
+		env.push new StrValue(str)
+	}
+}
+
+record CallCommand(char) {
+	function evaluate env {
+		STACK += char .." of "..env.toRepr()
+		if env.has char do
+			(env.get(char)).eval env
+		else
+			printStack()
+			error "Unknown command: `"..char.."'\n"
+		done
+		del STACK[-1]
+	}
+}
+
+/** Queue **/
+
+record Queue {
+	items : list<<Value>> = new list<<Value>>
+	
+	function push val... {
+		val if [ #val > 0 ] else identity | self.items += _
+	}
+	
+	function pull {
+		self.peek
+		del self.items[0]
+	}
+	
+	function pullAll {
+		self.pull while [ #self.items > 0 ]
+	}
+	
+	function peek {
+		if [ #self.items = 0 ] do
+			printStack
+			error "queue underflow ("..self..")"
+			return NIL
+		done
+		push self.items[0]
+	}
+	
+	function toString {
+		return "(" .. [item.toRepr() for item in self.items]&"," .. ")"
+	}
+}
