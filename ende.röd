@@ -59,7 +59,7 @@ record Value {
 		return self.dict[key] if [ self.dict[key]? ]
 		self.rec = TRUE
 		self.dict["__proto__"].get key if [ self.dict["__proto__"]? ] else
-		{ printStack(); error "Key not found: "..key.."\n"; push NIL }
+		{ printStack(); error "Key not found: "..key.."\n"; push NIL }
 		self.rec = FALSE
 	}
 	
@@ -141,6 +141,14 @@ record Value {
 	function toInteger {
 		return 0
 	}
+	
+	function toBoolean {
+		if [ self.dict["__bool__"]? ] do
+			self.dict["__bool__"].toBoolean
+		else
+			true
+		done
+	}
 }
 
 record CmdValue(body) : Value {
@@ -179,6 +187,10 @@ record StrValue(str) : Value {
 	function toInteger {
 		parseInteger str if [ str =~ "-?[0-9]+" ] else return 0
 	}
+	
+	function toBoolean {
+		return str != ""
+	}
 }
 
 record IntValue(int) : Value {
@@ -188,12 +200,22 @@ record IntValue(int) : Value {
 		return dict
 	}()
 	
+	val : integer = int
+	
 	function toInteger {
-		return int
+		return self.val
 	}
 	
 	function toString {
-		return `$int`
+		return `${self.val}`
+	}
+	
+	function toRepr {
+		return `${self.val}`
+	}
+	
+	function toBoolean {
+		return self.val != 0
 	}
 }
 
@@ -209,21 +231,81 @@ post_load: {
 	
 	STR_PROTO := new Value
 	INT_PROTO := new Value
+	PROMISE_PROTO := new Value
+	REPEAT_PROTO := new Value
 	
 	OBJ.dict["__name__"] = new StrValue("Object")
 	keys BUILTINS | OBJ.dict[_1] = new CmdValue(BUILTINS[_1])
 	OBJ.dict["__proto__"] = NIL
+	OBJ.dict["__bool__"] = new IntValue(1)
 	
 	NIL.dict["__name__"] = new StrValue("Nil")
+	NIL.dict["__bool__"] = new IntValue(0)
+	OBJ.dict["Nil"] = NIL
 	
 	STR_PROTO.dict["__name__"] = new StrValue("String")
 	STR_PROTO.dict["."] = new CmdValue({ |env|; push new StrValue(env.parent().toString()..env.parPulln(1).toString()) })
+	OBJ.dict["String"] = STR_PROTO
 	
 	INT_PROTO.dict["__name__"] = new StrValue("Integer")
 	INT_PROTO.dict["+"] = new CmdValue({ |env|; push new IntValue(env.parent().toInteger()+env.parPulln(1).toInteger()) })
 	INT_PROTO.dict["-"] = new CmdValue({ |env|; push new IntValue(env.parent().toInteger()-env.parPulln(1).toInteger()) })
 	INT_PROTO.dict["*"] = new CmdValue({ |env|; push new IntValue(env.parent().toInteger()*env.parPulln(1).toInteger()) })
 	INT_PROTO.dict["/"] = new CmdValue({ |env|; push new IntValue(env.parent().toInteger()/env.parPulln(1).toInteger()) })
+	seq 0, 9 | for i do
+		INT_PROTO.dict[`$i`] = new CmdValue({ |env|
+			obj := env.parent()
+			{ printStack(); error "primitive operation on non-primitive object" } unless [ obj is IntValue ]
+			obj.val *= 10
+			obj.val += i
+		})
+	done
+	OBJ.dict["Integer"] = INT_PROTO
+	
+	PROMISE_PROTO.dict["__name__"] = new StrValue("Promise")
+	["ok", "then", "fail", "catch"] | for init, handle do
+		PROMISE_PROTO.dict[init] = new CmdValue({ |env|
+			obj := env.parent()
+			payload := env.pulln(1)
+			if obj.has "_h"..init do
+				env2 := obj.get("_e"..init)
+				callback := obj.get("_h"..init)
+				env2.push payload
+				parse(callback.toString()) | _.evaluate env2
+			else
+				obj.dict["_v"..msg] = payload
+			done
+		})
+		PROMISE_PROTO.dict[handle] = new CmdValue({ |env|
+			obj := env.parent()
+			env2 := obj.pulln(1)
+			callback := obj.pulln(1)
+			if obj.has "_v"..init do
+				env2.push obj.get("_v"..init)
+				parse(callback.toString()) | _.evaluate env2
+			else
+				obj.dict["_h"..init] = callback
+				obj.dict["_e"..init] = env2
+			done
+		})
+	done
+	OBJ.dict["Promise"] = PROMISE_PROTO
+	
+	REPEAT_PROTO.dict["__name__"] = new StrValue("Repeat")
+	REPEAT_PROTO.dict["loop"] = new CmdValue({ |env|
+		obj := env.parent()
+		env2 := obj.get("environment")
+		cond := [parse(obj.get("condition").toString())]
+		body := [parse(obj.get("body").toString())]
+		while {
+			cond | _.evaluate env2
+			bool := env2.pulln(1)
+			bool.toBoolean
+		} do
+			body | _.evaluate env2
+		done
+	})
+	OBJ.dict["Repeat"] = REPEAT_PROTO
 }
 
 {
@@ -237,9 +319,6 @@ post_load: {
 	
 	/* numbers */
 	BUILTINS["#"] = { |env|; push new IntValue(0) }
-	seq 0, 9 | for i do
-		BUILTINS[`$i`] = { |env|; push env.parPulln()*10+i}
-	done
 
 	/* eval */
 	BUILTINS["^"] = { |env|; env.subenv env, env2; env.parPulln 1 | parse(_.toString()) | _.evaluate env2; env2.end }
@@ -252,6 +331,19 @@ post_load: {
 	BUILTINS["&"] = { |env|; env.parPulln 1 | _.pulln(1) }
 	BUILTINS["?"] = { |env|; env.parPulln 1 | (env.parent()).get(key.toString()) for key }
 	BUILTINS["="] = { |env|; env.parPulln 2 | (env.parent()).dict[key.toString()] = val for key, val }
+
+	/* control flow */
+	BUILTINS["i"] = { |env|
+		cond := env.parPulln(1)
+		env.subenv env, promise
+		promise.dict["__proto__"] = PROMISE_PROTO
+		if cond.toBoolean do
+			promise.dict["_vok"] = cond
+		else
+			promise.dict["_vfail"] = cond
+		done
+		env.parPush promise
+	}
 
 	/* i/o */
 	BUILTINS["d"] = { |env|; env.parPulln 1 | STDOUT.push _.toString() }
