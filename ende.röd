@@ -125,7 +125,7 @@ record Value {
 		return "[object "..self.dict["__name__"].toString().."]" if [ self.dict["__name__"]? ]
 		return "..." if [ self.rec ]
 		self.rec = TRUE
-		val := [keys(self.dict) | push `$key: ${self.dict[key].toRepr()}` for key]&", "
+		val := [keys(self.dict) | sort | push `$key: ${self.dict[key].toRepr()}` for key]&", "
 		push "{"..val.."; "..self.queueToString().."}"
 		self.rec = FALSE
 	}
@@ -232,7 +232,7 @@ post_load: {
 	STR_PROTO := new Value
 	INT_PROTO := new Value
 	PROMISE_PROTO := new Value
-	REPEAT_PROTO := new Value
+	LIST_PROTO := new Value
 	
 	OBJ.dict["__name__"] = new StrValue("Object")
 	keys BUILTINS | OBJ.dict[_1] = new CmdValue(BUILTINS[_1])
@@ -291,21 +291,27 @@ post_load: {
 	done
 	OBJ.dict["Promise"] = PROMISE_PROTO
 	
-	REPEAT_PROTO.dict["__name__"] = new StrValue("Repeat")
-	REPEAT_PROTO.dict["loop"] = new CmdValue({ |env|
+	LIST_PROTO.dict["__name__"] = new StrValue("List")
+	LIST_PROTO.dict["f"] = new CmdValue({ |env|
 		obj := env.parent()
-		env2 := obj.get("environment")
-		cond := [parse(obj.get("condition").toString())]
-		body := [parse(obj.get("body").toString())]
-		while {
-			cond | _.evaluate env2
-			bool := env2.pulln(1)
-			bool.toBoolean
-		} do
-			body | _.evaluate env2
+		env2 := obj.pulln(1)
+		callback := obj.pulln(1)
+		i := 0
+		while obj.has `$i` do
+			env2.push obj.get(`$i`)
+			parse(callback.toString()) | _.evaluate env2
+			i ++
 		done
 	})
-	OBJ.dict["Repeat"] = REPEAT_PROTO
+	LIST_PROTO.dict["length"] = new CmdValue({ |env|
+		obj := env.parent()
+		i := 0
+		while obj.has `$i` do
+			i++
+		done
+		obj.push new IntValue(i)
+	})
+	OBJ.dict["List"] = LIST_PROTO
 }
 
 {
@@ -319,6 +325,12 @@ post_load: {
 	
 	/* numbers */
 	BUILTINS["#"] = { |env|; push new IntValue(0) }
+	BUILTINS["range"] = { |env|
+		env.subenv env, range
+		range.dict["__proto__"] = LIST_PROTO
+		env.parPulln 2 | _.toInteger | seq _, _ | enum | range.dict[`$_2`] = new IntValue(_1)
+		env.parPush range
+	}
 
 	/* eval */
 	BUILTINS["^"] = { |env|; env.subenv env, env2; env.parPulln 1 | parse(_.toString()) | _.evaluate env2; env2.end }
@@ -326,11 +338,12 @@ post_load: {
 	BUILTINS[":"] = { |env|; obj := env.parPulln(1); env.parPulln 1 | parse(_.toString()) | _.evaluate obj }
 	
 	/* objs */
-	BUILTINS["$"] = { |env|; push env }
+	BUILTINS["$"] = { |env|; env.parent }
 	BUILTINS[">"] = { |env|; env.parPulln 2 | obj.push val for obj, val }
 	BUILTINS["&"] = { |env|; env.parPulln 1 | _.pulln(1) }
 	BUILTINS["?"] = { |env|; env.parPulln 1 | (env.parent()).get(key.toString()) for key }
 	BUILTINS["="] = { |env|; env.parPulln 2 | (env.parent()).dict[key.toString()] = val for key, val }
+	BUILTINS["!"] = { |env|; env.parPulln 1 | del (env.parent()).dict[_.toString()] }
 
 	/* control flow */
 	BUILTINS["i"] = { |env|
@@ -349,6 +362,17 @@ post_load: {
 	BUILTINS["d"] = { |env|; env.parPulln 1 | STDOUT.push _.toString() }
 	BUILTINS["r"] = { |env|; env.parPulln 1 | STDOUT.push _.toRepr() }
 	BUILTINS["q"] = { |env|; env.parPulln 1 | STDOUT.push _.queue.toString() }
+	
+	BUILTINS["l"] = { |env|
+		env.subenv env, promise
+		promise.dict["__proto__"] = PROMISE_PROTO
+		try do
+			promise.dict["_vok"] = new StrValue(STDIN.pull())
+		catch e
+			promise.dict["_vfail"] = new StrValue(e.message)
+		done
+		env.parPush promise
+	}
 }
 
 /** Parser **/
